@@ -1,18 +1,33 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DEFAULT_PLUGIN_PATH = path.resolve(__dirname, "..");
+const DEFAULT_CONFIG_PATH = path.join(process.env.HOME || "~", ".openclaw", "openclaw.json");
 
 function usage(msg) {
   if (msg) console.error(`\nERROR: ${msg}\n`);
   console.error(`Usage:
-  node scripts/install-openclaw.mjs --config <path-to-openclaw.json> --pluginPath <path-to-plugin-repo> [--discordChannelId <id>] [--pollEveryMs 30000] [--idleEscalateMs 300000] [--mention "@here"] [--restart] [--verify] [--installDeps]
+  npm run install:openclaw -- [options]
+
+Options:
+  --config <path>          Path to openclaw.json (default: ~/.openclaw/openclaw.json)
+  --pluginPath <path>      Path to plugin directory (default: auto-detected from script location)
+  --discordChannelId <id>  Discord channel ID for briefing posts (optional)
+  --pollEveryMs <ms>       Polling interval in ms (default: 30000)
+  --idleEscalateMs <ms>    Idle escalation interval in ms (default: 300000)
+  --mention <string>       Discord mention string (default: "@here")
+  --restart                Restart Gateway after patching config
+  --verify                 Verify plugin loaded after restart
+  --installDeps            Run 'npm install' in the plugin directory
 
 Notes:
 - This script edits openclaw.json in-place but will write a timestamped backup first.
 - It validates JSON before writing.
 - It enables the plugin and configures it under plugins.entries["progress-briefing"].
-- With --installDeps, it runs 'npm install' in the plugin directory.
-- With --verify, it runs 'openclaw plugins list' to confirm the plugin is loadable.
 `);
   process.exit(1);
 }
@@ -23,6 +38,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith("--")) usage(`Unexpected arg: ${a}`);
     const key = a.slice(2);
+    if (key === "help" || key === "h") usage();
     const next = argv[i + 1];
     const isBool = key === "restart" || key === "verify" || key === "installDeps";
     if (isBool) {
@@ -62,10 +78,8 @@ function unique(arr) {
 
 async function main() {
   const args = parseArgs(process.argv);
-  const configPath = args.config || process.env.OPENCLAW_CONFIG;
-  const pluginPath = args.pluginPath || process.env.OPENCLAW_PLUGIN_PATH;
-  if (!configPath) usage("--config is required (or set OPENCLAW_CONFIG)");
-  if (!pluginPath) usage("--pluginPath is required (or set OPENCLAW_PLUGIN_PATH)");
+  const configPath = args.config || process.env.OPENCLAW_CONFIG || DEFAULT_CONFIG_PATH;
+  const pluginPath = args.pluginPath || process.env.OPENCLAW_PLUGIN_PATH || DEFAULT_PLUGIN_PATH;
 
   const absConfig = path.resolve(configPath);
   const absPlugin = path.resolve(pluginPath);

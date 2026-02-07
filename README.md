@@ -1,13 +1,13 @@
 # Progress Briefing (OpenClaw plugin)
 
-An OpenClaw utility plugin that keeps a tiny “job status board” and periodically publishes a human-readable briefing.
+An OpenClaw utility plugin that keeps a tiny "job status board" and periodically publishes a human-readable briefing.
 
 By default it:
 
 - exposes 2 tools for agents to report/query progress
 - runs a background service inside the Gateway
 - logs briefings to Gateway logs
-- **optionally posts the briefing to Discord** (recommended; works with OpenClaw’s existing Discord bot token)
+- **optionally posts the briefing to Discord** (recommended; works with OpenClaw's existing Discord bot token)
 - optionally **auto-observes Gateway health signals** by scanning the Gateway log (useful for quickly surfacing errors without manual reporting)
 
 ---
@@ -26,7 +26,7 @@ Optional (for Discord delivery):
 - A Discord bot configured in OpenClaw (`channels.discord.token` present)
 - A target Discord channel ID
 
-If you’re brand new to OpenClaw, start here:
+If you're brand new to OpenClaw, start here:
 
 - Install/setup OpenClaw: https://docs.openclaw.ai
 
@@ -34,25 +34,40 @@ If you’re brand new to OpenClaw, start here:
 
 ## Quickstart (5 minutes)
 
+### Option A: Standard plugin location (recommended)
+
+```bash
+# Clone to the standard OpenClaw plugins directory
+mkdir -p ~/.openclaw/plugins
+cd ~/.openclaw/plugins
+git clone https://github.com/effortprogrammer/openclaw-progress-briefing.git
+cd openclaw-progress-briefing
+
+npm install
+
+# Install the plugin (config path and plugin path are auto-detected)
+npm run install:openclaw -- \
+  --discordChannelId "<DISCORD_CHANNEL_ID>" \
+  --restart \
+  --verify
+```
+
+### Option B: Clone anywhere
+
 ```bash
 git clone https://github.com/effortprogrammer/openclaw-progress-briefing.git
 cd openclaw-progress-briefing
 
 npm install
 
-# If you want Discord delivery, replace <DISCORD_CHANNEL_ID>.
-# If you only want Gateway logs (no Discord), you can omit --discordChannelId.
+# Plugin path is auto-detected from the script location
 npm run install:openclaw -- \
-  --config ~/.openclaw/openclaw.json \
-  --pluginPath "$(pwd)" \
   --discordChannelId "<DISCORD_CHANNEL_ID>" \
-  --mention "@here" \
   --restart \
   --verify
-
-# Optional: view agent status in the Gateway (after agents report)
-# openclaw agent --agent pm --message "progress_briefing_agents"
 ```
+
+> **Note:** If you only want Gateway logs (no Discord), simply omit `--discordChannelId`.
 
 ---
 
@@ -76,38 +91,34 @@ From the plugin repo directory:
 # 1) Install deps (this repo is tiny)
 npm install
 
-# 2) Patch ~/.openclaw/openclaw.json (creates a timestamped .bak.* backup)
+# 2) Patch config + restart + verify (all-in-one)
 npm run install:openclaw -- \
-  --config ~/.openclaw/openclaw.json \
-  --pluginPath "$(pwd)" \
-  --discordChannelId "<DISCORD_CHANNEL_ID>" \
-  --mention "@here"
-
-# 3) Restart Gateway to apply
-openclaw gateway restart
-```
-
-If you want the installer to restart the Gateway for you, add `--restart`:
-
-```bash
-npm run install:openclaw -- \
-  --config ~/.openclaw/openclaw.json \
-  --pluginPath "$(pwd)" \
-  --discordChannelId "<DISCORD_CHANNEL_ID>" \
-  --restart
-```
-
-If you also want it to verify the plugin loaded (by running `openclaw plugins list`), add `--verify`.
-
-If you’ve just cloned the repo, also add `--installDeps` so the Gateway can import dependencies when loading the plugin.
-
-```bash
-npm run install:openclaw -- \
-  --config ~/.openclaw/openclaw.json \
-  --pluginPath "$(pwd)" \
   --discordChannelId "<DISCORD_CHANNEL_ID>" \
   --restart \
+  --verify
+```
+
+The installer auto-detects:
+- **Config path:** `~/.openclaw/openclaw.json` (override with `--config <path>`)
+- **Plugin path:** The directory containing this script (override with `--pluginPath <path>`)
+
+#### Additional options
+
+```bash
+# Minimal: just patch config, no restart
+npm run install:openclaw
+
+# With custom mention
+npm run install:openclaw -- \
+  --discordChannelId "<DISCORD_CHANNEL_ID>" \
+  --mention "@everyone" \
+  --restart
+
+# First-time setup: also install npm dependencies
+npm run install:openclaw -- \
+  --discordChannelId "<DISCORD_CHANNEL_ID>" \
   --installDeps \
+  --restart \
   --verify
 ```
 
@@ -162,9 +173,9 @@ openclaw system event --text "briefing probe" --mode now
 ## How it works
 
 ### Data model
-The plugin tracks “jobs” keyed by `jobId`.
+The plugin tracks "jobs" keyed by `jobId`.
 
-Each update is appended to a JSONL file, and the “current state” is computed by reading the file and keeping only the latest record per `jobId`.
+Each update is appended to a JSONL file, and the "current state" is computed by reading the file and keeping only the latest record per `jobId`.
 
 **Job fields** (current MVP):
 
@@ -172,7 +183,7 @@ Each update is appended to a JSONL file, and the “current state” is computed
 - `title` (string, optional)
 - `owner` (string, optional; e.g. agent name)
 - `state` (enum): `registered | running | waiting | blocked | completed | failed`
-- `progress` (number 0–100, optional)
+- `progress` (number 0-100, optional)
 - `detail` (string, optional)
 
 ### Storage
@@ -194,7 +205,7 @@ On each tick, the plugin groups jobs by state and renders sections like:
 - COMPLETED
 - FAILED
 
-(“completed” jobs are filtered out by default in the tool output, but the background service currently includes all jobs it reads.)
+("completed" jobs are filtered out by default in the tool output, but the background service currently includes all jobs it reads.)
 
 ### Background service publishing
 The plugin registers a Gateway service (`id: "progress-briefing"`) that runs every `pollEveryMs`.
@@ -202,7 +213,7 @@ The plugin registers a Gateway service (`id: "progress-briefing"`) that runs eve
 Publishing logic:
 
 - It posts at least every `pollEveryMs`.
-- It can also “idle escalate” if there has been no job activity for `idleEscalateMs`.
+- It can also "idle escalate" if there has been no job activity for `idleEscalateMs`.
 - It always logs to the Gateway log.
 - If Discord is enabled and configured, it sends the same text to Discord.
 
@@ -214,9 +225,9 @@ Observation scope:
 
 - `scope: "gateway"` (recommended): scans for **conservative** Gateway/OpenClaw health signals (HTTP 5xx, HTTP 401/invalid token, and common network errors).
 
-Escalation note: escalation mentions are **latched** (persisted) until the next scheduled Discord post, so you won’t miss a tag just because the error spike happened between posting intervals.
+Escalation note: escalation mentions are **latched** (persisted) until the next scheduled Discord post, so you won't miss a tag just because the error spike happened between posting intervals.
 
-Threshold note: the escalation threshold is now **cumulative from the first observed error** (per agent), not “3 errors in a single tick.” This makes the alert timing much more predictable.
+Threshold note: the escalation threshold is now **cumulative from the first observed error** (per agent), not "3 errors in a single tick." This makes the alert timing much more predictable.
 
 Synthetic jobs:
 
@@ -290,7 +301,7 @@ Config:
 
 Notes:
 
-- This is **heuristic** log scanning (MVP). It’s meant to answer “is anything obviously broken?” at a glance.
+- This is **heuristic** log scanning (MVP). It's meant to answer "is anything obviously broken?" at a glance.
 - It does not rely on any swarm/orchestration APIs; it works even if parts of the system are degraded.
 - Future improvement: improve pattern coverage + add richer attribution (the current default patterns are intentionally conservative).
 
@@ -342,7 +353,7 @@ Parameters:
 ### 3) `progress_briefing_agents`
 Show what each agent is currently doing (manual agent-reported status).
 
-This tool expects each agent to maintain a single “current status” job with:
+This tool expects each agent to maintain a single "current status" job with:
 
 - `jobId`: `agent:<agentId>:current`
 - `owner`: `<agentId>`
@@ -384,7 +395,7 @@ If your goal is to always know what each agent is doing, use the copy/paste temp
 
 - `docs/TASK_ASSIGNMENT_TEMPLATE.md`
 
-This forces a consistent, per-agent “current work” line using `jobId=agent:<id>:current`, which you can view via the `progress_briefing_agents` tool.
+This forces a consistent, per-agent "current work" line using `jobId=agent:<id>:current`, which you can view via the `progress_briefing_agents` tool.
 
 ## Operating it (recommended workflow)
 
@@ -397,7 +408,7 @@ This forces a consistent, per-agent “current work” line using `jobId=agent:<
 
 3) When done, mark `state: completed` (or `failed`).
 
-The briefing service will keep a rolling “what’s happening” summary in both:
+The briefing service will keep a rolling "what's happening" summary in both:
 
 - Gateway logs
 - Discord (if enabled)
@@ -406,7 +417,7 @@ The briefing service will keep a rolling “what’s happening” summary in bot
 
 ## Troubleshooting
 
-- Plugin doesn’t load:
+- Plugin doesn't load:
   - Run `openclaw plugins list`
   - Check `plugins.load.paths` contains this repo path
   - Restart: `openclaw gateway restart`
@@ -424,8 +435,8 @@ The briefing service will keep a rolling “what’s happening” summary in bot
 
 ## Known limitations (MVP)
 
-- JSONL store is simple and append-only; there’s no compaction yet.
-- “What each agent is doing” is only as good as what agents report in `agent:<id>:current` (manual, or via your heartbeat convention).
+- JSONL store is simple and append-only; there's no compaction yet.
+- "What each agent is doing" is only as good as what agents report in `agent:<id>:current` (manual, or via your heartbeat convention).
 - Auto-observe is heuristic log scanning; keep patterns conservative to avoid false positives.
 - Discord sends are plain text (no embeds/threads yet).
 
