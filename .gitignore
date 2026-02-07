@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# build output (future-proof)
+dist/
+*.tsbuildinfo
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+
+# local data (plugin runtime store)
+.progress-briefing/
+
+# flock local db (if you ever run flock in this directory by accident)
+.flock-data/

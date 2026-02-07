@@ -1,0 +1,92 @@
+{
+  "id": "progress-briefing",
+  "name": "Progress Briefing",
+  "kind": "utility",
+  "version": "0.1.0",
+  "description": "Briefs progress of parallel agent jobs; can post briefings to Discord.",
+  "entry": "./index.ts",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean", "default": true },
+      "pollEveryMs": { "type": "integer", "minimum": 5000, "default": 30000 },
+      "idleEscalateMs": { "type": "integer", "minimum": 60000, "default": 300000 },
+      "store": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "dataDir": { "type": "string", "default": ".progress-briefing" },
+          "backend": { "type": "string", "enum": ["jsonl"], "default": "jsonl" }
+        },
+        "default": { "dataDir": ".progress-briefing", "backend": "jsonl" }
+      },
+      "discord": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "channelId": { "type": "string" },
+          "mention": { "type": "string", "description": "Optional mention string, e.g. <@userId> or @here" }
+        }
+      },
+      "observe": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "scope": { "type": "string", "enum": ["flock", "gateway"], "default": "gateway" },
+          "logPath": { "type": "string", "description": "Path to gateway log file (default: /tmp/openclaw/openclaw-YYYY-MM-DD.log)" },
+          "maxBytesPerTick": { "type": "integer", "minimum": 1024, "default": 1048576 },
+          "includeRegexes": { "type": "array", "items": { "type": "string" } },
+          "excludeRegexes": { "type": "array", "items": { "type": "string" } },
+          "perAgentJobs": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean", "default": false },
+              "minCount": { "type": "integer", "minimum": 1, "default": 1 }
+            }
+          },
+          "escalate": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean", "default": false },
+              "threshold": { "type": "integer", "minimum": 1, "default": 3 },
+              "cooldownMs": { "type": "integer", "minimum": 0, "default": 300000 },
+              "mention": { "type": "string", "default": "@here" }
+            }
+          }
+        }
+      }
+    },
+    "required": ["enabled"]
+  },
+  "uiHints": {
+    "enabled": { "label": "Enabled" },
+    "pollEveryMs": { "label": "Poll interval (ms)" },
+    "idleEscalateMs": { "label": "Idle escalation (ms)" },
+    "store": { "label": "Storage" },
+    "discord": { "label": "Discord" },
+    "discord.enabled": { "label": "Send briefings to Discord" },
+    "discord.channelId": { "label": "Discord channel ID", "placeholder": "1234567890" },
+    "discord.mention": { "label": "Mention" },
+    "observe": { "label": "Observation" },
+    "observe.enabled": { "label": "Auto-observe health from gateway logs" },
+    "observe.scope": { "label": "Observe scope" },
+    "observe.logPath": { "label": "Gateway log path" },
+    "observe.maxBytesPerTick": { "label": "Observe read cap (bytes per tick)" },
+    "observe.includeRegexes": { "label": "Include regexes" },
+    "observe.excludeRegexes": { "label": "Exclude regexes" },
+    "observe.perAgentJobs": { "label": "Per-agent jobs" },
+    "observe.perAgentJobs.enabled": { "label": "Create per-agent Flock health jobs" },
+    "observe.perAgentJobs.minCount": { "label": "Per-agent min count" },
+
+    "observe.escalate": { "label": "Escalation" },
+    "observe.escalate.enabled": { "label": "Escalate (force mention) on repeated errors" },
+    "observe.escalate.threshold": { "label": "Error threshold (per-agent count)" },
+    "observe.escalate.cooldownMs": { "label": "Escalation cooldown (ms)" },
+    "observe.escalate.mention": { "label": "Escalation mention" }
+  }
+}

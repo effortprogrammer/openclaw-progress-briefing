@@ -1,0 +1,14 @@
+{
+  "name": "progress-briefing",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "install:openclaw": "node scripts/install-openclaw.mjs"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.0"
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}

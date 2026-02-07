@@ -1,0 +1,936 @@
+import { Type } from "@sinclair/typebox";
+import fs from "node:fs";
+import path from "node:path";
+
+type ProgressBriefingConfig = {
+  enabled: boolean;
+  pollEveryMs?: number;
+  idleEscalateMs?: number;
+  store?: { dataDir?: string; backend?: "jsonl" };
+  discord?: { enabled?: boolean; channelId?: string; mention?: string };
+  observe?: {
+    enabled?: boolean;
+
+    /**
+     * Observation scope:
+     * - "flock": only scan flock-related log lines (back-compat default)
+     * - "gateway": scan generic OpenClaw/Gateway error signals (recommended if you don't use Flock)
+     */
+    scope?: "flock" | "gateway";
+
+    /** Path to the gateway log file to scan (newline-delimited). */
+    logPath?: string;
+
+    /** Cap how many bytes we read per tick (safety). */
+    maxBytesPerTick?: number;
+
+    /** Optional override filters (regex strings). If provided, they take precedence over scope defaults. */
+    includeRegexes?: string[];
+    excludeRegexes?: string[];
+
+    /** Optional: create/update per-agent health jobs (e.g. flock:agent:pm). */
+    perAgentJobs?: {
+      enabled?: boolean;
+      /** Minimum per-tick count for an agent to get its own job update. */
+      minCount?: number;
+    };
+
+    /** If error counts exceed threshold, force a Discord mention prefix for the briefing. */
+    escalate?: {
+      enabled?: boolean;
+      threshold?: number;
+      cooldownMs?: number;
+      mention?: string;
+    };
+  };
+};
+
+type JobState =
+  | "registered"
+  | "running"
+  | "waiting"
+  | "blocked"
+  | "completed"
+  | "failed";
+
+type JobRecord = {
+  jobId: string;
+  title?: string;
+  owner?: string; // agent/session/etc
+  state: JobState;
+  progress?: number; // 0..100
+  detail?: string;
+  createdAt: number;
+  updatedAt: number;
+  lastActivityAt: number;
+};
+
+function now() {
+  return Date.now();
+}
+
+function todayLogPath() {
+  // Matches OpenClaw gateway default: /tmp/openclaw/openclaw-YYYY-MM-DD.log
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `/tmp/openclaw/openclaw-${yyyy}-${mm}-${dd}.log`;
+}
+
+function ensureDir(p: string) {
+  fs.mkdirSync(p, { recursive: true });
+}
+
+function safeJsonParse<T>(s: string): T | null {
+  try {
+    return JSON.parse(s) as T;
+  } catch {
+    return null;
+  }
+}
+
+function formatBrief(jobs: JobRecord[], opts?: { header?: string }) {
+  const by = {
+    running: [] as JobRecord[],
+    waiting: [] as JobRecord[],
+    blocked: [] as JobRecord[],
+    completed: [] as JobRecord[],
+    failed: [] as JobRecord[],
+    registered: [] as JobRecord[],
+  };
+  for (const j of jobs) {
+    (by[j.state] ?? by.registered).push(j);
+  }
+
+  const fmt = (j: JobRecord) => {
+    const pct = typeof j.progress === "number" ? ` (${j.progress}%)` : "";
+    const detail = j.detail ? ` — ${j.detail}` : "";
+    return `- [${j.state}] ${j.title ?? j.jobId}${pct}${detail}`;
+  };
+
+  const lines: string[] = [];
+  if (opts?.header) lines.push(opts.header);
+
+  const section = (name: string, arr: JobRecord[]) => {
+    if (!arr.length) return;
+    lines.push(`${name} (${arr.length})`);
+    for (const j of arr) lines.push(fmt(j));
+    lines.push("");
+  };
+
+  section("RUNNING", by.running);
+  section("WAITING", by.waiting);
+  section("BLOCKED", by.blocked);
+  section("COMPLETED", by.completed);
+  section("FAILED", by.failed);
+
+  if (!lines.length) return "(no jobs)";
+  return lines.join("\n").trim();
+}
+
+async function discordSendText(params: {
+  token: string;
+  channelId: string;
+  content: string;
+}) {
+  const res = await fetch(
+    `https://discord.com/api/v10/channels/${params.channelId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bot ${params.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ content: params.content }),
+    },
+  );
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Discord send failed: ${res.status} ${res.statusText} ${text}`);
+  }
+}
+
+export default function register(api: any) {
+  const cfg: ProgressBriefingConfig = (api.config?.plugins?.entries?.["progress-briefing"]
+    ?.config ?? { enabled: true }) as any;
+
+  const enabled = cfg.enabled !== false;
+  const dataDir = path.resolve(
+    api.config?.agents?.defaults?.workspace ?? process.cwd(),
+    cfg.store?.dataDir ?? ".progress-briefing",
+  );
+  const jobsPath = path.join(dataDir, "jobs.jsonl");
+  const statePath = path.join(dataDir, "state.json");
+
+  ensureDir(dataDir);
+
+  let state = {
+    lastBriefAt: 0,
+    lastNoMsgEscalationAt: 0,
+
+    // Observation cursor (for scanning gateway logs incrementally)
+    observe: {
+      logPath: "",
+      pos: 0,
+      lastSize: 0,
+      lastEscalateAt: 0,
+      lastEscalateReason: "",
+
+      // Persistent per-agent escalation counters (across ticks)
+      // Shape: { [scope]: { [agentId]: number } }
+      counters: {} as Record<string, Record<string, number>>,
+    },
+
+    // Escalation state: computed by observe(), consumed by the next Discord post.
+    // Persisted so we don't miss escalation if it triggers between posting intervals.
+    observeEscalation: {
+      pending: false,
+      forcedMention: "",
+      reason: "",
+      setAt: 0,
+    },
+
+    // Back-compat placeholder (no longer used)
+    observeLast: {
+      escalated: false,
+      forcedMention: "",
+      reason: "",
+    },
+  };
+
+  const loadState = () => {
+    if (!fs.existsSync(statePath)) return;
+    const parsed = safeJsonParse<any>(fs.readFileSync(statePath, "utf8"));
+    if (!parsed) return;
+
+    // Shallow merge is dangerous for nested objects (it would overwrite defaults
+    // like observe.counters). Do a small targeted deep merge for known keys.
+    state = { ...state, ...parsed };
+    if (parsed.observe) state.observe = { ...state.observe, ...parsed.observe };
+    if (parsed.observeEscalation)
+      state.observeEscalation = {
+        ...state.observeEscalation,
+        ...parsed.observeEscalation,
+      };
+  };
+
+  const saveState = () => {
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  };
+
+  const observeFromGatewayLogs = () => {
+    const obsEnabled = cfg.observe?.enabled === true;
+    if (!obsEnabled) return;
+
+    const scope = cfg.observe?.scope ?? "gateway";
+
+    // Ensure persistent structures exist even if an older state.json overwrote them.
+    state.observe.counters ??= {};
+    const logPath = cfg.observe?.logPath ?? todayLogPath();
+    const maxBytes = cfg.observe?.maxBytesPerTick ?? 1024 * 1024; // 1MB
+
+    const compileRegexes = (arr?: string[]) => {
+      const out: RegExp[] = [];
+      for (const s of arr ?? []) {
+        try {
+          out.push(new RegExp(s));
+        } catch {
+          // ignore invalid regex
+        }
+      }
+      return out;
+    };
+
+    const include = compileRegexes(cfg.observe?.includeRegexes);
+    const exclude = compileRegexes(cfg.observe?.excludeRegexes);
+
+    const defaultIncludeGateway = [
+      // Keep this list conservative: prefer real HTTP/auth/network signals.
+      /\bGateway HTTP\b/i,
+      /\bHTTP\s+4\d\d\b/i,
+      /\bHTTP\s+5\d\d\b/i,
+      /authentication_error/i,
+      /Invalid bearer token/i,
+      /ETIMEDOUT/i,
+      /ECONNRESET/i,
+      /ENOTFOUND/i,
+      /EAI_AGAIN/i,
+    ];
+
+    const matches = (line: string) => {
+      if (exclude.some((r) => r.test(line))) return false;
+
+      if (include.length) {
+        return include.some((r) => r.test(line));
+      }
+
+      if (scope === "flock") return line.includes("[flock");
+      // gateway
+      return defaultIncludeGateway.some((r) => r.test(line));
+    };
+
+    const baseJobId = scope === "gateway" ? "gateway:health" : "flock:health";
+    const baseTitle =
+      scope === "gateway" ? "Gateway health (auto)" : "Flock health (auto)";
+
+    try {
+      if (!fs.existsSync(logPath)) {
+        upsertJob({
+          jobId: baseJobId,
+          title: baseTitle,
+          owner: "observe",
+          state: "waiting",
+          detail: `gateway log not found: ${logPath}`,
+        });
+        return;
+      }
+
+      const st = fs.statSync(logPath);
+      const size = st.size;
+
+      // Reset cursor if log rotated/truncated or path changed.
+      if (state.observe.logPath !== logPath || size < (state.observe.pos ?? 0)) {
+        state.observe.logPath = logPath;
+        state.observe.pos = Math.max(0, size - maxBytes);
+      }
+
+      const start = Math.max(0, state.observe.pos ?? 0);
+      const end = size;
+      const bytesToRead = Math.min(maxBytes, Math.max(0, end - start));
+      const readStart = Math.max(0, end - bytesToRead);
+
+      const fd = fs.openSync(logPath, "r");
+      const buf = Buffer.alloc(bytesToRead);
+      fs.readSync(fd, buf, 0, bytesToRead, readStart);
+      fs.closeSync(fd);
+
+      state.observe.pos = end;
+      state.observe.lastSize = size;
+
+      const text = buf.toString("utf8");
+      const lines = text.split(/\r?\n/).filter(Boolean);
+
+      // Very lightweight heuristics; we can get fancy later.
+      let count401 = 0;
+      let count405 = 0;
+      let count429 = 0;
+      let count5xx = 0;
+      let countExecutorFailed = 0;
+      let countExecFailed = 0;
+      let countPluginLoadFailed = 0;
+
+      const agents401 = new Map<string, number>();
+      const agentsExecutorFailed = new Map<string, number>();
+      const agents405 = new Map<string, number>();
+      const agents429 = new Map<string, number>();
+      const agents5xx = new Map<string, number>();
+
+      const bump = (m: Map<string, number>, k: string) =>
+        m.set(k, (m.get(k) ?? 0) + 1);
+
+      const extractAgent = (line: string) => {
+        // Flock-style (log line may contain JSON-escaped quotes: \"pm\")
+        const m1 = line.match(/Agent\s+(?:\\"|")([^\\\"]+)(?:\\"|")\s+responded:/);
+        if (m1?.[1]) return m1[1];
+
+        // Flock executor
+        const m2 = line.match(/\bfor\s+([a-zA-Z0-9_-]+)@/);
+        if (m2?.[1]) return m2[1];
+
+        // Generic OpenClaw lane/session tags
+        const m3 = line.match(/session:agent:([a-zA-Z0-9_-]+)/);
+        if (m3?.[1]) return m3[1];
+
+        return "";
+      };
+
+      for (const l of lines) {
+        if (!matches(l)) continue;
+
+        const agent = extractAgent(l);
+
+        const is401 =
+          l.includes("HTTP 401") ||
+          l.includes("authentication_error") ||
+          l.includes("Invalid bearer token");
+        const is405 = l.includes("Gateway HTTP 405") || /\bHTTP\s+405\b/.test(l);
+        const is429 = /\bHTTP\s+429\b/.test(l) || l.includes("rate_limit");
+        const is5xx = /\bHTTP\s+5\d\d\b/.test(l) || /\bGateway HTTP\s+5\d\d\b/.test(l);
+        // NOTE: Keep gateway-scope observation focused on gateway/network/auth.
+        // Tool execution failures ("[tools] exec failed") are often benign during development
+        // and were causing noisy false-positives. We only count executor/tool failures in
+        // flock scope.
+        const isExecFail =
+          scope === "flock" && l.includes("[flock:executor]") && l.includes(" failed:");
+        const isExecToolFail =
+          scope === "flock" && (l.includes("Exec failed") || l.includes("ExecFailed"));
+        const isPluginLoadFail = scope === "flock" && l.includes("failed to load");
+
+        if (is401) {
+          count401++;
+          if (agent) bump(agents401, agent);
+        }
+
+        if (is405) {
+          count405++;
+          if (agent) bump(agents405, agent);
+        }
+
+        if (is429) {
+          count429++;
+          if (agent) bump(agents429, agent);
+        }
+
+        if (is5xx) {
+          count5xx++;
+          if (agent) bump(agents5xx, agent);
+        }
+
+        if (isExecFail) {
+          countExecutorFailed++;
+          if (agent) bump(agentsExecutorFailed, agent);
+        }
+
+        if (isExecToolFail) countExecFailed++;
+        if (isPluginLoadFail) countPluginLoadFailed++;
+      }
+
+      // Do NOT clear observeEscalation here; it's consumed on post().
+      // (Previously we reset observeLast each tick, which could drop escalation
+      // before the next scheduled post.)
+      state.observeLast = {
+        escalated: false,
+        forcedMention: "",
+        reason: "",
+      };
+
+      if (
+        count401 === 0 &&
+        count405 === 0 &&
+        count429 === 0 &&
+        count5xx === 0 &&
+        countExecutorFailed === 0 &&
+        countExecFailed === 0 &&
+        countPluginLoadFailed === 0
+      )
+        return;
+
+      const fmtMap = (m: Map<string, number>) =>
+        [...m.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([k, v]) => `${k}(${v})`)
+          .join(", ");
+
+      const detailParts = [] as string[];
+      if (count401) {
+        const a = fmtMap(agents401);
+        detailParts.push(`401=${count401}${a ? ` [${a}]` : ""}`);
+      }
+      if (count405) {
+        const a = fmtMap(agents405);
+        detailParts.push(`405=${count405}${a ? ` [${a}]` : ""}`);
+      }
+      if (count429) {
+        const a = fmtMap(agents429);
+        detailParts.push(`429=${count429}${a ? ` [${a}]` : ""}`);
+      }
+      if (count5xx) {
+        const a = fmtMap(agents5xx);
+        detailParts.push(`5xx=${count5xx}${a ? ` [${a}]` : ""}`);
+      }
+      if (countExecutorFailed) {
+        const a = fmtMap(agentsExecutorFailed);
+        detailParts.push(
+          `executorFailed=${countExecutorFailed}${a ? ` [${a}]` : ""}`,
+        );
+      }
+      if (countExecFailed) detailParts.push(`execFailed=${countExecFailed}`);
+      if (countPluginLoadFailed)
+        detailParts.push(`pluginLoadFailed=${countPluginLoadFailed}`);
+
+      const stateStr: JobState =
+        count401 ||
+        count405 ||
+        count429 ||
+        count5xx ||
+        countExecutorFailed ||
+        countExecFailed ||
+        countPluginLoadFailed
+          ? "blocked"
+          : "running";
+
+      // Optional: per-agent jobs (helps isolate the offender quickly)
+      const perAgentEnabled = cfg.observe?.perAgentJobs?.enabled === true;
+      const minCount = cfg.observe?.perAgentJobs?.minCount ?? 1;
+      if (perAgentEnabled) {
+        const agents = new Set([
+          ...agents401.keys(),
+          ...agentsExecutorFailed.keys(),
+          ...agents405.keys(),
+          ...agents429.keys(),
+          ...agents5xx.keys(),
+        ]);
+        for (const agent of agents) {
+          const c401 = agents401.get(agent) ?? 0;
+          const cExec = agentsExecutorFailed.get(agent) ?? 0;
+          const c405 = agents405.get(agent) ?? 0;
+          const c429 = agents429.get(agent) ?? 0;
+          const c5xx = agents5xx.get(agent) ?? 0;
+          const total = c401 + cExec + c405 + c429 + c5xx;
+          if (total < minCount) continue;
+
+          const parts: string[] = [];
+          if (c401) parts.push(`401=${c401}`);
+          if (c429) parts.push(`429=${c429}`);
+          if (c5xx) parts.push(`5xx=${c5xx}`);
+          if (cExec) parts.push(`executorFailed=${cExec}`);
+          if (c405) parts.push(`405=${c405}`);
+
+          upsertJob({
+            jobId: `${baseJobId.replace(/:health$/, ":agent")}:${agent}`,
+            title: `${baseTitle.replace(" health (auto)", " agent health")}: ${agent} (auto)`,
+            owner: "observe",
+            state: "blocked",
+            detail: parts.join(", "),
+          });
+        }
+      }
+
+      // Escalation (Discord forced mention) if threshold exceeded.
+      // NOTE: This is *cumulative* across ticks from the first observed error.
+      // We persist counters in state.observe.counters so escalation is predictable.
+      const esc = cfg.observe?.escalate;
+      const escEnabled = esc?.enabled === true;
+      const threshold = esc?.threshold ?? 3;
+      const cooldownMs = esc?.cooldownMs ?? 5 * 60_000;
+      const mention = esc?.mention ?? "@here";
+
+      if (escEnabled) {
+        const scopeCounters = (state.observe.counters[scope] ??= {});
+
+        const bumpN = (agentId: string, n: number) => {
+          if (!agentId || n <= 0) return;
+          scopeCounters[agentId] = (scopeCounters[agentId] ?? 0) + n;
+        };
+
+        // Aggregate error counts per agent for this tick and add them to cumulative counters.
+        const agents = new Set([
+          ...agents401.keys(),
+          ...agents405.keys(),
+          ...agents429.keys(),
+          ...agents5xx.keys(),
+          ...agentsExecutorFailed.keys(),
+        ]);
+
+        for (const agentId of agents) {
+          bumpN(agentId, agents401.get(agentId) ?? 0);
+          bumpN(agentId, agents405.get(agentId) ?? 0);
+          bumpN(agentId, agents429.get(agentId) ?? 0);
+          bumpN(agentId, agents5xx.get(agentId) ?? 0);
+          bumpN(agentId, agentsExecutorFailed.get(agentId) ?? 0);
+        }
+
+        // Determine offender: max cumulative count.
+        let offender = "";
+        let offenderCount = 0;
+        for (const [agentId, c] of Object.entries(scopeCounters)) {
+          if (c > offenderCount) {
+            offender = agentId;
+            offenderCount = c;
+          }
+        }
+
+        const shouldEscalate = offenderCount >= threshold;
+        const cooledDown =
+          now() - (state.observe.lastEscalateAt ?? 0) >= cooldownMs;
+
+        if (shouldEscalate && cooledDown) {
+          const reason = `error threshold hit: >=${threshold} (offender=${offender}, cumulative=${offenderCount})`;
+          state.observe.lastEscalateAt = now();
+          state.observe.lastEscalateReason = reason;
+
+          state.observeEscalation = {
+            pending: true,
+            forcedMention: mention,
+            reason,
+            setAt: now(),
+          };
+
+          // Avoid unbounded growth: cap counters at threshold once escalation fires.
+          // (Keeps state.json small and prevents immediate re-trigger after cooldown.)
+          if (offender) scopeCounters[offender] = threshold;
+        }
+      }
+
+      upsertJob({
+        jobId: baseJobId,
+        title: baseTitle,
+        owner: "observe",
+        state: stateStr,
+        detail: `Detected ${scope} errors in gateway logs: ${detailParts.join(", ")}`,
+      });
+
+      saveState();
+    } catch (err) {
+      api.logger.error(
+        `[progress-briefing][observe] failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
+  const readJobs = (): JobRecord[] => {
+    if (!fs.existsSync(jobsPath)) return [];
+    const lines = fs
+      .readFileSync(jobsPath, "utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const jobs: JobRecord[] = [];
+    for (const l of lines) {
+      const j = safeJsonParse<JobRecord>(l);
+      if (j?.jobId) jobs.push(j);
+    }
+    // Keep only latest per jobId.
+    const map = new Map<string, JobRecord>();
+    for (const j of jobs) map.set(j.jobId, j);
+    return [...map.values()].sort((a, b) => a.createdAt - b.createdAt);
+  };
+
+  const upsertJob = (patch: Partial<JobRecord> & { jobId: string }) => {
+    const jobs = readJobs();
+    const prev = jobs.find((j) => j.jobId === patch.jobId);
+    const base: JobRecord =
+      prev ??
+      ({
+        jobId: patch.jobId,
+        state: "registered",
+        createdAt: now(),
+        updatedAt: now(),
+        lastActivityAt: now(),
+      } as JobRecord);
+
+    const next: JobRecord = {
+      ...base,
+      ...patch,
+      updatedAt: now(),
+      lastActivityAt: now(),
+    };
+
+    fs.appendFileSync(jobsPath, JSON.stringify(next) + "\n");
+    return next;
+  };
+
+  api.registerTool({
+    name: "progress_briefing_report",
+    description:
+      "Register/update a job's progress for the Progress Briefing plugin.",
+    parameters: Type.Object({
+      jobId: Type.String(),
+      title: Type.Optional(Type.String()),
+      owner: Type.Optional(Type.String()),
+      state: Type.Optional(
+        Type.Union([
+          Type.Literal("registered"),
+          Type.Literal("running"),
+          Type.Literal("waiting"),
+          Type.Literal("blocked"),
+          Type.Literal("completed"),
+          Type.Literal("failed"),
+        ]),
+      ),
+      progress: Type.Optional(Type.Number({ minimum: 0, maximum: 100 })),
+      detail: Type.Optional(Type.String()),
+    }),
+    async execute(_id: string, params: any) {
+      if (!enabled) {
+        return {
+          content: [
+            { type: "text", text: "progress-briefing plugin disabled" },
+          ],
+        };
+      }
+      const next = upsertJob(params);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `ok: ${next.jobId} → ${next.state}`,
+          },
+        ],
+      };
+    },
+  });
+
+  api.registerTool({
+    name: "progress_briefing_status",
+    description: "Get the current briefing text.",
+    parameters: Type.Object({
+      includeCompleted: Type.Optional(Type.Boolean({ default: false })),
+    }),
+    async execute(_id: string, params: any) {
+      if (!enabled) {
+        return {
+          content: [
+            { type: "text", text: "progress-briefing plugin disabled" },
+          ],
+        };
+      }
+      const jobs = readJobs();
+      const filtered = params?.includeCompleted
+        ? jobs
+        : jobs.filter((j) => j.state !== "completed");
+      const text = formatBrief(filtered, {
+        header: `[progress-briefing] ${new Date().toISOString()}`,
+      });
+      return { content: [{ type: "text", text }] };
+    },
+  });
+
+  api.registerTool({
+    name: "progress_briefing_agents",
+    description:
+      "Show what each agent is currently doing (manual agent-reported status).",
+    parameters: Type.Object({}),
+    async execute(_id: string, _params: any) {
+      if (!enabled) {
+        return {
+          content: [
+            { type: "text", text: "progress-briefing plugin disabled" },
+          ],
+        };
+      }
+
+      const jobs = readJobs();
+      const agentJobs = jobs
+        .filter((j) => typeof j.jobId === "string" && j.jobId.startsWith("agent:") && j.jobId.endsWith(":current"))
+        .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+
+      const fmtAge = (ms: number) => {
+        if (!ms || ms <= 0) return "";
+        const s = Math.floor(ms / 1000);
+        if (s < 60) return `${s}s`;
+        const m = Math.floor(s / 60);
+        if (m < 60) return `${m}m`;
+        const h = Math.floor(m / 60);
+        return `${h}h`;
+      };
+
+      const extractAgentId = (jobId: string) => {
+        // agent:<agentId>:current
+        const parts = jobId.split(":");
+        return parts.length >= 3 ? parts[1] : "";
+      };
+
+      // Deduplicate by agentId (keep most recently updated)
+      const byAgent = new Map<string, JobRecord>();
+      for (const j of agentJobs) {
+        const agentId = extractAgentId(j.jobId);
+        if (!agentId) continue;
+        if (!byAgent.has(agentId)) byAgent.set(agentId, j);
+      }
+
+      const rows = [...byAgent.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+
+      const lines: string[] = [];
+      lines.push(`[progress-briefing] agent status — ${new Date().toLocaleString()}`);
+      if (!rows.length) {
+        lines.push("(no agent status yet — agents should report to jobId=agent:<id>:current)");
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
+      for (const [agentId, j] of rows) {
+        const pct = typeof j.progress === "number" ? ` (${j.progress}%)` : "";
+        const detail = j.detail ? ` — ${j.detail}` : "";
+        const age = j.updatedAt ? ` · updated ${fmtAge(now() - j.updatedAt)} ago` : "";
+        lines.push(`- ${agentId}: [${j.state}]${pct}${detail}${age}`);
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  });
+
+  api.registerTool({
+    name: "progress_briefing_reset",
+    description:
+      "Reset progress-briefing state by clearing stored jobs + state (DANGEROUS).",
+    parameters: Type.Object({
+      confirm: Type.Boolean({
+        description: "Set true to confirm reset (this will delete stored briefing state).",
+      }),
+    }),
+    async execute(_id: string, params: any) {
+      if (!enabled) {
+        return {
+          content: [
+            { type: "text", text: "progress-briefing plugin disabled" },
+          ],
+        };
+      }
+      if (params?.confirm !== true) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "Refusing to reset without confirm=true. This will delete stored jobs/state.",
+            },
+          ],
+        };
+      }
+
+      // Clear job log + state. (Append-only store; truncating is simplest.)
+      try {
+        if (fs.existsSync(jobsPath)) fs.writeFileSync(jobsPath, "");
+        state = {
+          lastBriefAt: 0,
+          lastNoMsgEscalationAt: 0,
+          observe: {
+            logPath: "",
+            pos: 0,
+            lastSize: 0,
+            lastEscalateAt: 0,
+            lastEscalateReason: "",
+            counters: {},
+          },
+          observeEscalation: {
+            pending: false,
+            forcedMention: "",
+            reason: "",
+            setAt: 0,
+          },
+          observeLast: {
+            escalated: false,
+            forcedMention: "",
+            reason: "",
+          },
+        } as any;
+        saveState();
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `reset failed: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          { type: "text", text: "ok: cleared progress-briefing jobs + state" },
+        ],
+      };
+    },
+  });
+
+  api.registerService({
+    id: "progress-briefing",
+    start: async () => {
+      if (!enabled) {
+        api.logger.info("[progress-briefing] disabled");
+        return;
+      }
+
+      loadState();
+
+      const pollEveryMs = cfg.pollEveryMs ?? 30_000;
+      const idleEscalateMs = cfg.idleEscalateMs ?? 5 * 60_000;
+
+      api.logger.info(
+        `[progress-briefing] started (pollEveryMs=${pollEveryMs}, idleEscalateMs=${idleEscalateMs})`,
+      );
+
+      const tick = async () => {
+        // Optional: auto-observe flock health from gateway logs.
+        observeFromGatewayLogs();
+
+        const jobs = readJobs();
+        const text = formatBrief(jobs, {
+          header: `[progress-briefing] ${new Date().toLocaleString()}`,
+        });
+
+        const discordEnabled = cfg.discord?.enabled !== false;
+        const channelId = cfg.discord?.channelId;
+        const discordToken = api.config?.channels?.discord?.token;
+
+        // Idle escalation: if no job updates recently, still post a short status.
+        const lastActivity = Math.max(
+          0,
+          ...jobs.map((j) => j.lastActivityAt ?? 0),
+        );
+        const idleFor = lastActivity ? now() - lastActivity : now();
+
+        const shouldPost =
+          now() - (state.lastBriefAt ?? 0) >= pollEveryMs ||
+          (idleFor >= idleEscalateMs &&
+            now() - (state.lastNoMsgEscalationAt ?? 0) >= idleEscalateMs);
+
+        if (!shouldPost) return;
+
+        let content = text;
+
+        // Forced mention escalation from observation (e.g. repeated errors)
+        const forcedMention = state.observeEscalation?.pending
+          ? state.observeEscalation.forcedMention
+          : "";
+        const mention = forcedMention || cfg.discord?.mention;
+
+        if (mention) content = `${mention}\n${content}`;
+        if (state.observeEscalation?.pending && state.observeEscalation?.reason) {
+          content = `${content}\n\n[escalation] ${state.observeEscalation.reason}`;
+        }
+
+        try {
+          if (discordEnabled && channelId && discordToken) {
+            await discordSendText({
+              token: discordToken,
+              channelId,
+              content,
+            });
+          }
+          // Always log to gateway logs.
+          api.logger.info(`\n${content}`);
+
+          // Escalation consumed once we've posted.
+          if (state.observeEscalation?.pending) {
+            state.observeEscalation.pending = false;
+          }
+
+          state.lastBriefAt = now();
+          if (idleFor >= idleEscalateMs) {
+            state.lastNoMsgEscalationAt = now();
+          }
+          saveState();
+        } catch (err) {
+          api.logger.error(
+            `[progress-briefing] brief post failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      };
+
+      const interval = setInterval(() => {
+        tick().catch((err) =>
+          api.logger.error(
+            `[progress-briefing] tick failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          ),
+        );
+      }, pollEveryMs);
+
+      // Save for stop()
+      (api as any).__progressBriefingInterval = interval;
+    },
+    stop: async () => {
+      const interval = (api as any).__progressBriefingInterval as
+        | NodeJS.Timeout
+        | undefined;
+      if (interval) clearInterval(interval);
+    },
+  });
+}

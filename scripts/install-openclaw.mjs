@@ -1,0 +1,208 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+
+function usage(msg) {
+  if (msg) console.error(`\nERROR: ${msg}\n`);
+  console.error(`Usage:
+  node scripts/install-openclaw.mjs --config <path-to-openclaw.json> --pluginPath <path-to-plugin-repo> [--discordChannelId <id>] [--pollEveryMs 30000] [--idleEscalateMs 300000] [--mention "@here"] [--restart] [--verify] [--installDeps]
+
+Notes:
+- This script edits openclaw.json in-place but will write a timestamped backup first.
+- It validates JSON before writing.
+- It enables the plugin and configures it under plugins.entries["progress-briefing"].
+- With --installDeps, it runs 'npm install' in the plugin directory.
+- With --verify, it runs 'openclaw plugins list' to confirm the plugin is loadable.
+`);
+  process.exit(1);
+}
+
+function parseArgs(argv) {
+  const args = {};
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("--")) usage(`Unexpected arg: ${a}`);
+    const key = a.slice(2);
+    const next = argv[i + 1];
+    const isBool = key === "restart" || key === "verify" || key === "installDeps";
+    if (isBool) {
+      args[key] = true;
+      continue;
+    }
+    if (!next || next.startsWith("--")) usage(`Missing value for --${key}`);
+    args[key] = next;
+    i++;
+  }
+  return args;
+}
+
+function readJson(p) {
+  const raw = fs.readFileSync(p, "utf8");
+  return JSON.parse(raw);
+}
+
+function writeJsonAtomic(p, obj) {
+  const dir = path.dirname(p);
+  const tmp = path.join(dir, `.openclaw.json.tmp.${Date.now()}`);
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", "utf8");
+  // validate
+  JSON.parse(fs.readFileSync(tmp, "utf8"));
+  fs.renameSync(tmp, p);
+}
+
+function ensureArray(x) {
+  if (!x) return [];
+  if (Array.isArray(x)) return x;
+  return [x];
+}
+
+function unique(arr) {
+  return [...new Set(arr)];
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  const configPath = args.config || process.env.OPENCLAW_CONFIG;
+  const pluginPath = args.pluginPath || process.env.OPENCLAW_PLUGIN_PATH;
+  if (!configPath) usage("--config is required (or set OPENCLAW_CONFIG)");
+  if (!pluginPath) usage("--pluginPath is required (or set OPENCLAW_PLUGIN_PATH)");
+
+  const absConfig = path.resolve(configPath);
+  const absPlugin = path.resolve(pluginPath);
+
+  if (!fs.existsSync(absConfig)) usage(`Config not found: ${absConfig}`);
+  if (!fs.existsSync(absPlugin)) usage(`Plugin path not found: ${absPlugin}`);
+
+  const cfg = readJson(absConfig);
+
+  cfg.plugins ??= {};
+  cfg.plugins.load ??= {};
+  cfg.plugins.load.paths = unique([
+    ...ensureArray(cfg.plugins.load.paths),
+    absPlugin,
+  ]);
+
+  cfg.plugins.entries ??= {};
+  cfg.plugins.entries["progress-briefing"] ??= { enabled: true, config: {} };
+
+  cfg.plugins.entries["progress-briefing"].enabled = true;
+  cfg.plugins.entries["progress-briefing"].config ??= {};
+
+  const entryCfg = cfg.plugins.entries["progress-briefing"].config;
+  entryCfg.enabled = true;
+  entryCfg.pollEveryMs = args.pollEveryMs ? Number(args.pollEveryMs) : (entryCfg.pollEveryMs ?? 30000);
+  entryCfg.idleEscalateMs = args.idleEscalateMs ? Number(args.idleEscalateMs) : (entryCfg.idleEscalateMs ?? 300000);
+  entryCfg.store ??= { backend: "jsonl", dataDir: ".progress-briefing" };
+  entryCfg.store.backend ??= "jsonl";
+  entryCfg.store.dataDir ??= ".progress-briefing";
+
+  // Discord is optional, but default to enabled if a channel id is provided.
+  entryCfg.discord ??= {};
+  if (args.discordChannelId) {
+    entryCfg.discord.enabled = true;
+    entryCfg.discord.channelId = String(args.discordChannelId);
+  } else {
+    // Don’t force enable without a channelId.
+    entryCfg.discord.enabled = entryCfg.discord.enabled ?? true;
+  }
+  if (args.mention) entryCfg.discord.mention = String(args.mention);
+
+  // backup
+  const backupPath = `${absConfig}.bak.${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  fs.copyFileSync(absConfig, backupPath);
+
+  writeJsonAtomic(absConfig, cfg);
+
+  console.log("OK: Updated OpenClaw config:");
+  console.log(" -", absConfig);
+  console.log("Backup:");
+  console.log(" -", backupPath);
+  console.log("Plugin path added:");
+  console.log(" -", absPlugin);
+
+  const { spawnSync } = await import("node:child_process");
+
+  const runCmd = (cmd, cmdArgs, opts = {}) => {
+    const res = spawnSync(cmd, cmdArgs, { stdio: "inherit", ...opts });
+    if (res.error) throw res.error;
+    return res.status ?? 1;
+  };
+
+  // Optional: install dependencies (so the Gateway can import them when loading the plugin).
+  // This repo is intentionally unbundled; dependencies should be installed in-place.
+  if (args.installDeps) {
+    const code = runCmd("npm", ["install"], { cwd: absPlugin });
+    if (code !== 0) {
+      console.error("WARN: `npm install` failed. You may need to run it manually.");
+      process.exit(code);
+    }
+  }
+
+  if (args.restart) {
+    const code = runCmd("openclaw", ["gateway", "restart"]);
+    if (code !== 0) {
+      console.error("WARN: openclaw gateway restart failed. Please restart manually.");
+      process.exit(code);
+    }
+  } else {
+    console.log("Next: run `openclaw gateway restart` to apply.");
+  }
+
+  if (args.verify) {
+    // Use --json so we can reliably parse status (the interactive table output can be hard to capture).
+    const res = spawnSync("openclaw", ["plugins", "list", "--json"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 30000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+
+    const out = (res.stdout || "") + (res.stderr || "");
+
+    if (res.error) {
+      console.error(out.trim());
+      console.error(
+        "WARN: openclaw plugins list --json errored or timed out during --verify. Run `openclaw plugins list` manually.",
+      );
+      throw res.error;
+    }
+    if ((res.status ?? 1) !== 0) {
+      console.error(out.trim());
+      console.error("WARN: openclaw plugins list failed. Verify manually.");
+      process.exit(res.status ?? 1);
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(res.stdout || "{}");
+    } catch {
+      console.error(res.stdout || "");
+      console.error("WARN: Could not parse JSON from `openclaw plugins list --json`. Verify manually.");
+      process.exit(1);
+    }
+
+    const plugins = Array.isArray(parsed?.plugins) ? parsed.plugins : [];
+    const entry = plugins.find((p) => p?.id === "progress-briefing");
+
+    if (!entry) {
+      console.error(
+        "VERIFY FAIL: progress-briefing not found in plugin list. Check plugins.load.paths + plugins.entries.",
+      );
+      process.exit(1);
+    }
+
+    const status = String(entry.status || "");
+    if (status === "loaded") {
+      console.log("VERIFY OK: progress-briefing is loaded.");
+    } else {
+      console.error(`VERIFY FAIL: progress-briefing status=${status || "(unknown)"}`);
+      if (entry?.error) console.error(String(entry.error));
+      process.exit(1);
+    }
+  }
+}
+
+main().catch((e) => {
+  console.error(String(e?.stack || e));
+  process.exit(1);
+});
