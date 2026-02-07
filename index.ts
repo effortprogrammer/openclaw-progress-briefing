@@ -318,6 +318,7 @@ export default function register(api: any) {
   let state = {
     lastBriefAt: 0,
     lastNoMsgEscalationAt: 0,
+    lastBriefContent: "", // Track last posted content to avoid duplicate posts
 
     // Observation cursor (for scanning gateway logs incrementally)
     observe: {
@@ -1017,10 +1018,20 @@ export default function register(api: any) {
         );
         const idleFor = lastActivity ? now() - lastActivity : now();
 
+        // Check if content has changed (ignore timestamp in header for comparison)
+        const textWithoutHeader = text.replace(/^\[progress-briefing\] [^\n]+\n?/, "");
+        const lastWithoutHeader = (state.lastBriefContent ?? "").replace(/^\[progress-briefing\] [^\n]+\n?/, "");
+        const contentChanged = textWithoutHeader !== lastWithoutHeader;
+
+        // Only post if: (1) enough time passed AND content changed, OR (2) escalation pending
+        const timePassed = now() - (state.lastBriefAt ?? 0) >= pollEveryMs;
+        const idleEscalation =
+          idleFor >= idleEscalateMs &&
+          now() - (state.lastNoMsgEscalationAt ?? 0) >= idleEscalateMs;
+        const hasEscalation = state.observeEscalation?.pending;
+
         const shouldPost =
-          now() - (state.lastBriefAt ?? 0) >= pollEveryMs ||
-          (idleFor >= idleEscalateMs &&
-            now() - (state.lastNoMsgEscalationAt ?? 0) >= idleEscalateMs);
+          (timePassed && contentChanged) || idleEscalation || hasEscalation;
 
         if (!shouldPost) return;
 
@@ -1054,6 +1065,7 @@ export default function register(api: any) {
           }
 
           state.lastBriefAt = now();
+          state.lastBriefContent = text; // Track content to avoid duplicate posts
           if (idleFor >= idleEscalateMs) {
             state.lastNoMsgEscalationAt = now();
           }
