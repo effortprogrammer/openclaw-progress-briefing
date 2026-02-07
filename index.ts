@@ -1023,15 +1023,13 @@ export default function register(api: any) {
         const lastWithoutHeader = (state.lastBriefContent ?? "").replace(/^\[progress-briefing\] [^\n]+\n?/, "");
         const contentChanged = textWithoutHeader !== lastWithoutHeader;
 
-        // Only post if: (1) enough time passed AND content changed, OR (2) escalation pending
+        // Only post if: (1) enough time passed AND content changed, OR (2) error escalation pending
+        // Note: idle escalation disabled — no need to post "no activity" repeatedly
         const timePassed = now() - (state.lastBriefAt ?? 0) >= pollEveryMs;
-        const idleEscalation =
-          idleFor >= idleEscalateMs &&
-          now() - (state.lastNoMsgEscalationAt ?? 0) >= idleEscalateMs;
         const hasEscalation = state.observeEscalation?.pending;
 
         const shouldPost =
-          (timePassed && contentChanged) || idleEscalation || hasEscalation;
+          (timePassed && contentChanged) || hasEscalation;
 
         if (!shouldPost) return;
 
@@ -1066,9 +1064,6 @@ export default function register(api: any) {
 
           state.lastBriefAt = now();
           state.lastBriefContent = text; // Track content to avoid duplicate posts
-          if (idleFor >= idleEscalateMs) {
-            state.lastNoMsgEscalationAt = now();
-          }
           saveState();
         } catch (err) {
           api.logger.error(
