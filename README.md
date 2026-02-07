@@ -37,9 +37,9 @@ If you're brand new to OpenClaw, start here:
 ### Option A: Standard plugin location (recommended)
 
 ```bash
-# Clone to the standard OpenClaw plugins directory
-mkdir -p ~/.openclaw/plugins
-cd ~/.openclaw/plugins
+# Clone to the standard OpenClaw extensions directory
+mkdir -p ~/.openclaw/extensions
+cd ~/.openclaw/extensions
 git clone https://github.com/effortprogrammer/openclaw-progress-briefing.git
 cd openclaw-progress-briefing
 
