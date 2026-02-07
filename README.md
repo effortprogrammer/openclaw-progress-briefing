@@ -12,6 +12,58 @@ By default it:
 
 ---
 
+## Prerequisites
+
+You should have:
+
+- OpenClaw installed and the Gateway running
+  - Check: `openclaw status`
+- Node.js + npm available (for `npm install` in this repo)
+  - Check: `node -v` and `npm -v`
+
+Optional (for Discord delivery):
+
+- A Discord bot configured in OpenClaw (`channels.discord.token` present)
+- A target Discord channel ID
+
+If you’re brand new to OpenClaw, start here:
+
+- Install/setup OpenClaw: https://docs.openclaw.ai
+
+---
+
+## Quickstart (5 minutes)
+
+```bash
+git clone https://github.com/effortprogrammer/openclaw-progress-briefing.git
+cd openclaw-progress-briefing
+
+npm install
+
+# If you want Discord delivery, replace <DISCORD_CHANNEL_ID>.
+# If you only want Gateway logs (no Discord), you can omit --discordChannelId.
+npm run install:openclaw -- \
+  --config ~/.openclaw/openclaw.json \
+  --pluginPath "$(pwd)" \
+  --discordChannelId "<DISCORD_CHANNEL_ID>" \
+  --mention "@here" \
+  --restart \
+  --verify
+
+# Optional: view agent status in the Gateway (after agents report)
+# openclaw agent --agent pm --message "progress_briefing_agents"
+```
+
+---
+
+## Getting your Discord channel ID
+
+1) In Discord: User Settings → Advanced → enable **Developer Mode**
+2) Right-click your target channel → **Copy Channel ID**
+3) Paste it into the install command as `<DISCORD_CHANNEL_ID>`
+
+---
+
 ## Setup / Install
 
 ### Automatic install (recommended)
@@ -78,6 +130,12 @@ Notes:
   - `channels.discord.token` present in OpenClaw config (i.e. Discord channel is configured in OpenClaw)
 - If the token is missing, the plugin falls back to logging-only.
 
+If you need to connect Discord first:
+
+```bash
+openclaw channels login --channel discord --verbose
+```
+
 ### Verify it loaded
 
 ```bash
@@ -85,6 +143,19 @@ openclaw plugins list
 ```
 
 You should see `Progress Briefing (progress-briefing)`.
+
+### Quick functional test
+
+1) Force a short heartbeat tick (optional):
+
+```bash
+openclaw system event --text "briefing probe" --mode now
+```
+
+2) Wait up to `pollEveryMs` (default 5 minutes) and confirm:
+
+- you see a `[progress-briefing] ...` block in **Gateway logs** (`openclaw logs --follow`)
+- and/or a new message in the configured **Discord channel**
 
 ---
 
@@ -330,6 +401,24 @@ The briefing service will keep a rolling “what’s happening” summary in bot
 
 - Gateway logs
 - Discord (if enabled)
+
+---
+
+## Troubleshooting
+
+- Plugin doesn’t load:
+  - Run `openclaw plugins list`
+  - Check `plugins.load.paths` contains this repo path
+  - Restart: `openclaw gateway restart`
+
+- Nothing shows up in Discord:
+  - Confirm OpenClaw Discord token exists (`channels.discord.token`)
+  - Confirm you set the correct channel ID (`plugins.entries["progress-briefing"].config.discord.channelId`)
+  - Check Gateway logs for send errors: `openclaw logs --follow | grep -i discord`
+
+- `BLOCKED` feels noisy:
+  - Keep `observe.includeRegexes` conservative (HTTP 401/5xx + network only)
+  - Add `excludeRegexes` for any known-benign patterns in your environment
 
 ---
 
