@@ -8,6 +8,16 @@ type ProgressBriefingConfig = {
   idleEscalateMs?: number;
   store?: { dataDir?: string; backend?: "jsonl" };
   discord?: { enabled?: boolean; channelId?: string; mention?: string };
+  
+  /** Auto-track agent tool calls via hooks (no manual reporting needed). */
+  activity?: {
+    enabled?: boolean;
+    /** Max recent tool calls to keep in memory (default: 10). */
+    maxRecent?: number;
+    /** Tool names to exclude from tracking (e.g. ["progress_briefing_status"]). */
+    excludeTools?: string[];
+  };
+
   observe?: {
     enabled?: boolean;
 
@@ -53,6 +63,28 @@ type JobState =
   | "completed"
   | "failed";
 
+/** Tracks an active (in-progress) tool call. */
+type ActiveToolCall = {
+  toolName: string;
+  params: Record<string, unknown>;
+  sessionKey?: string;
+  agentId?: string;
+  startedAt: number;
+};
+
+/** Tracks a recently completed tool call. */
+type RecentToolCall = {
+  toolName: string;
+  params: Record<string, unknown>;
+  result?: unknown;
+  error?: string;
+  sessionKey?: string;
+  agentId?: string;
+  startedAt: number;
+  endedAt: number;
+  durationMs: number;
+};
+
 type JobRecord = {
   jobId: string;
   title?: string;
@@ -90,7 +122,17 @@ function safeJsonParse<T>(s: string): T | null {
   }
 }
 
-function formatBrief(jobs: JobRecord[], opts?: { header?: string }) {
+function formatBrief(
+  jobs: JobRecord[], 
+  opts?: { 
+    header?: string;
+    activeTools?: Array<{ toolName: string; params: Record<string, unknown>; startedAt: number; sessionKey?: string }>;
+    recentTools?: Array<{ toolName: string; params: Record<string, unknown>; durationMs: number; error?: string; result?: unknown }>;
+    formatParamsSummary?: (params: Record<string, unknown>, maxLen?: number) => string;
+    formatResultSummary?: (result: unknown, error?: string) => string;
+    formatDuration?: (ms: number) => string;
+  }
+) {
   const by = {
     running: [] as JobRecord[],
     waiting: [] as JobRecord[],
@@ -112,6 +154,36 @@ function formatBrief(jobs: JobRecord[], opts?: { header?: string }) {
   const lines: string[] = [];
   if (opts?.header) lines.push(opts.header);
 
+  // Helper for duration formatting (fallback)
+  const fmtDur = opts?.formatDuration ?? ((ms: number) => ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
+  const fmtParams = opts?.formatParamsSummary ?? (() => "");
+  const fmtResult = opts?.formatResultSummary ?? (() => "✓");
+
+  // Active tool calls section
+  if (opts?.activeTools && opts.activeTools.length > 0) {
+    lines.push(`🔄 ACTIVE (${opts.activeTools.length})`);
+    const now = Date.now();
+    for (const t of opts.activeTools) {
+      const elapsed = fmtDur(now - t.startedAt);
+      const params = fmtParams(t.params);
+      const session = t.sessionKey ? `[${t.sessionKey.split(":").pop()}]` : "";
+      lines.push(`- ${session} ${t.toolName}: ${params} (${elapsed}...)`);
+    }
+    lines.push("");
+  }
+
+  // Recent tool calls section
+  if (opts?.recentTools && opts.recentTools.length > 0) {
+    lines.push(`✅ RECENT (${opts.recentTools.length})`);
+    for (const t of opts.recentTools) {
+      const dur = fmtDur(t.durationMs);
+      const params = fmtParams(t.params);
+      const result = fmtResult(t.result, t.error);
+      lines.push(`- ${t.toolName}: ${params} ${result} (${dur})`);
+    }
+    lines.push("");
+  }
+
   const section = (name: string, arr: JobRecord[]) => {
     if (!arr.length) return;
     lines.push(`${name} (${arr.length})`);
@@ -119,11 +191,22 @@ function formatBrief(jobs: JobRecord[], opts?: { header?: string }) {
     lines.push("");
   };
 
-  section("RUNNING", by.running);
-  section("WAITING", by.waiting);
-  section("BLOCKED", by.blocked);
-  section("COMPLETED", by.completed);
-  section("FAILED", by.failed);
+  section("📋 RUNNING", by.running);
+  section("⏳ WAITING", by.waiting);
+  section("🚫 BLOCKED", by.blocked);
+  section("✔️ COMPLETED", by.completed);
+  section("❌ FAILED", by.failed);
+
+  // If we have header but nothing else, show "(no activity)"
+  const hasContent = (opts?.activeTools?.length ?? 0) > 0 
+    || (opts?.recentTools?.length ?? 0) > 0 
+    || by.running.length > 0 
+    || by.waiting.length > 0 
+    || by.blocked.length > 0;
+  
+  if (opts?.header && !hasContent) {
+    lines.push("(no activity)");
+  }
 
   if (!lines.length) return "(no jobs)";
   return lines.join("\n").trim();
@@ -165,6 +248,72 @@ export default function register(api: any) {
   const statePath = path.join(dataDir, "state.json");
 
   ensureDir(dataDir);
+
+  // ============================================================
+  // Activity tracking (tool calls via hooks)
+  // ============================================================
+  const activityEnabled = cfg.activity?.enabled !== false;
+  const maxRecentTools = cfg.activity?.maxRecent ?? 10;
+  const excludeTools = new Set(cfg.activity?.excludeTools ?? [
+    "progress_briefing_report",
+    "progress_briefing_status",
+    "progress_briefing_agents",
+    "progress_briefing_reset",
+  ]);
+
+  // In-memory tracking (not persisted)
+  const activeTools = new Map<string, ActiveToolCall>(); // key = toolCallId (or generated)
+  const recentTools: RecentToolCall[] = [];
+
+  const formatParamsSummary = (params: Record<string, unknown>, maxLen = 60): string => {
+    // Extract the most useful param for common tools
+    if (params.command && typeof params.command === "string") {
+      const cmd = params.command.length > maxLen 
+        ? params.command.slice(0, maxLen) + "…" 
+        : params.command;
+      return `\`${cmd}\``;
+    }
+    if (params.path && typeof params.path === "string") {
+      return `\`${params.path}\``;
+    }
+    if (params.file_path && typeof params.file_path === "string") {
+      return `\`${params.file_path}\``;
+    }
+    if (params.query && typeof params.query === "string") {
+      return `"${params.query.slice(0, maxLen)}"`;
+    }
+    if (params.url && typeof params.url === "string") {
+      return `\`${params.url.slice(0, maxLen)}\``;
+    }
+    // Fallback: show first string param
+    for (const [k, v] of Object.entries(params)) {
+      if (typeof v === "string" && v.length > 0) {
+        const val = v.length > maxLen ? v.slice(0, maxLen) + "…" : v;
+        return `${k}=\`${val}\``;
+      }
+    }
+    return "";
+  };
+
+  const formatResultSummary = (result: unknown, error?: string): string => {
+    if (error) return `❌ ${error.slice(0, 50)}`;
+    if (result === undefined || result === null) return "✓";
+    if (typeof result === "string") {
+      if (result.length < 20) return `→ ${result}`;
+      return `→ ${result.length} chars`;
+    }
+    if (typeof result === "object") {
+      const str = JSON.stringify(result);
+      if (str.length < 30) return `→ ${str}`;
+      return `→ ${str.length} bytes`;
+    }
+    return "✓";
+  };
+
+  const formatDuration = (ms: number): string => {
+    if (ms < 1000) return `${ms}ms`;
+    return `${(ms / 1000).toFixed(1)}s`;
+  };
 
   let state = {
     lastBriefAt: 0,
@@ -850,6 +999,11 @@ export default function register(api: any) {
         const jobs = readJobs();
         const text = formatBrief(jobs, {
           header: `[progress-briefing] ${new Date().toLocaleString()}`,
+          activeTools: activityEnabled ? [...activeTools.values()] : undefined,
+          recentTools: activityEnabled ? recentTools.slice(0, maxRecentTools) : undefined,
+          formatParamsSummary,
+          formatResultSummary,
+          formatDuration,
         });
 
         const discordEnabled = cfg.discord?.enabled !== false;
@@ -933,4 +1087,80 @@ export default function register(api: any) {
       if (interval) clearInterval(interval);
     },
   });
+
+  // ============================================================
+  // Tool call hooks for activity tracking
+  // ============================================================
+  if (activityEnabled && typeof api.on === "function") {
+    // Simple sequential ID for tracking
+    let callSeq = 0;
+    
+    api.on("before_tool_call", (event: any, ctx: any) => {
+      if (!activityEnabled) return;
+      const toolName = event?.toolName;
+      if (!toolName || excludeTools.has(toolName)) return;
+
+      const callId = `${++callSeq}`;
+      
+      activeTools.set(callId, {
+        toolName,
+        params: event?.params ?? {},
+        sessionKey: ctx?.sessionKey,
+        agentId: ctx?.agentId,
+        startedAt: now(),
+      });
+      
+      api.logger.debug(`[progress-briefing] before_tool_call: ${toolName} (id=${callId})`);
+    });
+
+    api.on("after_tool_call", (event: any, ctx: any) => {
+      if (!activityEnabled) return;
+      const toolName = event?.toolName;
+      if (!toolName || excludeTools.has(toolName)) return;
+
+      api.logger.debug(`[progress-briefing] after_tool_call: ${toolName}`);
+
+      // Find and remove the oldest matching tool call
+      let matchedId: string | undefined;
+      let matchedCall: ActiveToolCall | undefined;
+      
+      for (const [id, call] of activeTools) {
+        if (call.toolName === toolName) {
+          matchedId = id;
+          matchedCall = call;
+          break; // Take the first (oldest) match
+        }
+      }
+      
+      if (matchedId) {
+        activeTools.delete(matchedId);
+        api.logger.debug(`[progress-briefing] removed active call: ${matchedId}`);
+      }
+
+      const startedAt = matchedCall?.startedAt ?? now();
+      const endedAt = now();
+
+      // Add to recent list
+      recentTools.unshift({
+        toolName,
+        params: event?.params ?? matchedCall?.params ?? {},
+        result: event?.result,
+        error: event?.error,
+        sessionKey: ctx?.sessionKey ?? matchedCall?.sessionKey,
+        agentId: ctx?.agentId ?? matchedCall?.agentId,
+        startedAt,
+        endedAt,
+        durationMs: event?.durationMs ?? (endedAt - startedAt),
+      });
+
+      // Keep only maxRecentTools
+      while (recentTools.length > maxRecentTools) {
+        recentTools.pop();
+      }
+    });
+
+    api.logger.info(
+      `[progress-briefing] activity tracking enabled (maxRecent=${maxRecentTools}, excludeTools=${[...excludeTools].join(", ")})`,
+    );
+  }
 }
