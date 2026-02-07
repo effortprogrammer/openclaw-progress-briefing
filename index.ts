@@ -1113,12 +1113,13 @@ export default function register(api: any) {
       api.logger.debug(`[progress-briefing] before_tool_call: ${toolName} (id=${callId})`);
     });
 
-    api.on("after_tool_call", (event: any, ctx: any) => {
+    // Use tool_result_persist instead of after_tool_call (more reliable)
+    api.on("tool_result_persist", (event: any, ctx: any) => {
       if (!activityEnabled) return;
-      const toolName = event?.toolName;
+      const toolName = event?.toolName ?? ctx?.toolName;
       if (!toolName || excludeTools.has(toolName)) return;
 
-      api.logger.debug(`[progress-briefing] after_tool_call: ${toolName}`);
+      api.logger.debug(`[progress-briefing] tool_result_persist: ${toolName}`);
 
       // Find and remove the oldest matching tool call
       let matchedId: string | undefined;
@@ -1143,20 +1144,23 @@ export default function register(api: any) {
       // Add to recent list
       recentTools.unshift({
         toolName,
-        params: event?.params ?? matchedCall?.params ?? {},
-        result: event?.result,
-        error: event?.error,
+        params: matchedCall?.params ?? {},
+        result: undefined, // tool_result_persist doesn't give us the result easily
+        error: undefined,
         sessionKey: ctx?.sessionKey ?? matchedCall?.sessionKey,
         agentId: ctx?.agentId ?? matchedCall?.agentId,
         startedAt,
         endedAt,
-        durationMs: event?.durationMs ?? (endedAt - startedAt),
+        durationMs: endedAt - startedAt,
       });
 
       // Keep only maxRecentTools
       while (recentTools.length > maxRecentTools) {
         recentTools.pop();
       }
+      
+      // Return undefined to not modify the message
+      return undefined;
     });
 
     api.logger.info(
