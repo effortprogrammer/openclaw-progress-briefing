@@ -228,15 +228,14 @@ If quiet, just say 'All quiet 💤'."
 ```
 📊 OpenClaw Briefing (15:30)
 
-Active Sessions: 3
-- main: discussing project architecture
-- dev-code: implementing auth module
-- cron:session-briefing: (this briefing)
+🟢 ACTIVE
+- main: setting up session briefing cron, editing install script
+- dev-code: implementing auth module (exec: npm test)
 
-Flock Status:
-- Active: dev-code, pm
-- Idle: reviewer, qa, dev-prod
-- Tasks in progress: 2
+🟡 IDLE
+- pm, reviewer, qa, dev-prod
+
+📝 Tasks: 2 in progress
 ```
 
 ---

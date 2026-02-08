@@ -66,11 +66,9 @@ const BRIEFING_CRON_NAME = "session-briefing";
 
 const BRIEFING_PROMPT = `Time for OpenClaw session briefing.
 
-1. Use sessions_list(messageLimit: 1) to check all active sessions
-   - main, subagents, Flock agents, cron sessions, etc.
-2. If Flock plugin is active:
-   - flock_status for agent states (IDLE/ACTIVE/LEASED etc.)
-   - flock_tasks for in-progress tasks
+1. Use sessions_list(messageLimit: 2) to check ALL active sessions including main
+2. For each session with recent activity, summarize what they're doing
+3. If Flock plugin is active: flock_status for agent states
 
 Send the result to Discord channel {{CHANNEL_ID}}.
 
@@ -78,17 +76,23 @@ Format:
 \`\`\`
 📊 OpenClaw Briefing (HH:MM)
 
-Active Sessions: N
-- session-name: brief activity summary (1 line)
+🟢 ACTIVE
+- main: [brief description of recent activity]
+- session-name: [what they're doing]
 ...
 
-Flock Status: (if Flock is active)
-- Active: agent1, agent2
-- Idle: agent3, agent4
-- Tasks in progress: N
+🟡 IDLE
+- agent1, agent2, ...
+
+📝 Tasks: N in progress
 \`\`\`
 
-If no active sessions, just say 'All quiet 💤' briefly.`;
+Rules:
+- Include main session if it has recent activity
+- Show actual tool calls or conversation topics, not just 'active'
+- If a session is running exec/process, mention what command
+- Keep each line brief (1 line per session)
+- If truly nothing happening: 'All quiet 💤'`;
 
 function setupBriefingCron(args) {
   const channelId = args.briefingChannelId;
