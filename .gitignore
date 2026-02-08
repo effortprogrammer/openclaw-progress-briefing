@@ -18,3 +18,4 @@ yarn-error.log*
 
 # flock local db (if you ever run flock in this directory by accident)
 .flock-data/
+.flock/

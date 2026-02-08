@@ -14,20 +14,28 @@ function usage(msg) {
   npm run install:openclaw -- [options]
 
 Options:
-  --config <path>          Path to openclaw.json (default: ~/.openclaw/openclaw.json)
-  --pluginPath <path>      Path to plugin directory (default: auto-detected from script location)
-  --discordChannelId <id>  Discord channel ID for briefing posts (optional)
-  --pollEveryMs <ms>       Polling interval in ms (default: 30000)
-  --idleEscalateMs <ms>    Idle escalation interval in ms (default: 300000)
-  --mention <string>       Discord mention string (default: "@here")
-  --restart                Restart Gateway after patching config
-  --verify                 Verify plugin loaded after restart
-  --installDeps            Run 'npm install' in the plugin directory
+  --config <path>            Path to openclaw.json (default: ~/.openclaw/openclaw.json)
+  --pluginPath <path>        Path to plugin directory (default: auto-detected from script location)
+  --discordChannelId <id>    Discord channel ID for briefing posts (optional)
+  --pollEveryMs <ms>         Polling interval in ms (default: 30000)
+  --idleEscalateMs <ms>      Idle escalation interval in ms (default: 300000)
+  --mention <string>         Discord mention string (default: "@here")
+  --restart                  Restart Gateway after patching config
+  --verify                   Verify plugin loaded after restart
+  --installDeps              Run 'npm install' in the plugin directory
+
+Session Briefing Cron (Option B - agent-based):
+  --setupBriefing            Set up a cron job for periodic session briefing
+  --briefingChannelId <id>   Discord channel ID for briefing (required if --setupBriefing)
+  --briefingIntervalMs <ms>  Briefing interval in ms (default: 1800000 = 30 min)
+  --briefingModel <model>    Model for briefing agent (default: uses Gateway default)
 
 Notes:
 - This script edits openclaw.json in-place but will write a timestamped backup first.
 - It validates JSON before writing.
 - It enables the plugin and configures it under plugins.entries["progress-briefing"].
+- Session briefing cron uses an isolated agent session to check all OpenClaw sessions
+  and post a summary to Discord. This is independent of the plugin's own background service.
 `);
   process.exit(1);
 }
@@ -40,7 +48,7 @@ function parseArgs(argv) {
     const key = a.slice(2);
     if (key === "help" || key === "h") usage();
     const next = argv[i + 1];
-    const isBool = key === "restart" || key === "verify" || key === "installDeps";
+    const isBool = key === "restart" || key === "verify" || key === "installDeps" || key === "setupBriefing";
     if (isBool) {
       args[key] = true;
       continue;
@@ -50,6 +58,84 @@ function parseArgs(argv) {
     i++;
   }
   return args;
+}
+
+// --- Session Briefing Cron Setup ---
+
+const BRIEFING_CRON_NAME = "session-briefing";
+
+const BRIEFING_PROMPT = `Time for OpenClaw session briefing.
+
+1. Use sessions_list(messageLimit: 1) to check all active sessions
+   - main, subagents, Flock agents, cron sessions, etc.
+2. If Flock plugin is active:
+   - flock_status for agent states (IDLE/ACTIVE/LEASED etc.)
+   - flock_tasks for in-progress tasks
+
+Send the result to Discord channel {{CHANNEL_ID}}.
+
+Format:
+\`\`\`
+📊 OpenClaw Briefing (HH:MM)
+
+Active Sessions: N
+- session-name: brief activity summary (1 line)
+...
+
+Flock Status: (if Flock is active)
+- Active: agent1, agent2
+- Idle: agent3, agent4
+- Tasks in progress: N
+\`\`\`
+
+If no active sessions, just say 'All quiet 💤' briefly.`;
+
+function setupBriefingCron(args) {
+  const channelId = args.briefingChannelId;
+  if (!channelId) {
+    console.error("ERROR: --briefingChannelId is required when using --setupBriefing");
+    process.exit(1);
+  }
+  
+  const intervalMs = args.briefingIntervalMs ? Number(args.briefingIntervalMs) : 1800000;
+  const model = args.briefingModel || undefined;
+  
+  // Convert ms to duration string (e.g. 1800000 -> "30m")
+  const msToDuration = (ms) => {
+    if (ms >= 3600000 && ms % 3600000 === 0) return `${ms / 3600000}h`;
+    if (ms >= 60000 && ms % 60000 === 0) return `${ms / 60000}m`;
+    return `${ms / 1000}s`;
+  };
+  
+  const durationStr = msToDuration(intervalMs);
+  const prompt = BRIEFING_PROMPT.replace("{{CHANNEL_ID}}", channelId);
+  
+  // Print setup instructions (CLI is too slow for scripted execution)
+  console.log(`\n${"=".repeat(60)}`);
+  console.log(`SESSION BRIEFING CRON SETUP`);
+  console.log(`${"=".repeat(60)}`);
+  console.log(`\nTo enable periodic session briefing, run this command:\n`);
+  
+  const cliCmd = [
+    `openclaw cron add`,
+    `  --name "${BRIEFING_CRON_NAME}"`,
+    `  --every "${durationStr}"`,
+    `  --session isolated`,
+    `  --timeout-seconds 120`,
+    `  --no-deliver`,
+    model ? `  --model "${model}"` : null,
+    `  --message "${prompt.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`,
+  ].filter(Boolean).join(" \\\n");
+  
+  console.log(cliCmd);
+  
+  console.log(`\n${"─".repeat(60)}`);
+  console.log(`Or simply ask your OpenClaw assistant:`);
+  console.log(`\n  "Set up a session-briefing cron job that runs every ${durationStr}`);
+  console.log(`   and posts to Discord channel ${channelId}"`);
+  console.log(`\n${"=".repeat(60)}\n`);
+  
+  return true;
 }
 
 function readJson(p) {
@@ -213,6 +299,11 @@ async function main() {
       if (entry?.error) console.error(String(entry.error));
       process.exit(1);
     }
+  }
+
+  // --- Setup Session Briefing Cron (Option B) ---
+  if (args.setupBriefing) {
+    setupBriefingCron(args);
   }
 }
 

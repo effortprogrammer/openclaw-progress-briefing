@@ -170,6 +170,77 @@ openclaw system event --text "briefing probe" --mode now
 
 ---
 
+## Session Briefing via Cron (Option B)
+
+Instead of relying on the plugin's background service, you can set up a **cron-based session briefing** that uses an agent to check all OpenClaw sessions and post a summary to Discord.
+
+**Benefits:**
+- No plugin development needed — uses built-in OpenClaw tools
+- Agent writes natural language summaries (more readable)
+- Covers **all sessions** (main, subagents, Flock agents, cron sessions)
+- Easy to customize by changing the prompt
+
+### Quick setup
+
+Add `--setupBriefing` to your install command:
+
+```bash
+npm run install:openclaw -- \
+  --setupBriefing \
+  --briefingChannelId "<DISCORD_CHANNEL_ID>" \
+  --briefingIntervalMs 1800000 \
+  --restart
+```
+
+This prints the cron setup command. Run it, or simply ask your OpenClaw assistant:
+
+> "Set up a session-briefing cron job that runs every 30 minutes and posts to Discord channel &lt;ID&gt;"
+
+### Manual cron setup
+
+```bash
+openclaw cron add \
+  --name "session-briefing" \
+  --every "30m" \
+  --session isolated \
+  --timeout-seconds 120 \
+  --no-deliver \
+  --message "Time for OpenClaw session briefing.
+
+1. Use sessions_list(messageLimit: 1) to check all active sessions
+2. If Flock plugin is active: flock_status + flock_tasks
+3. Send summary to Discord channel <CHANNEL_ID>
+
+Format: Active sessions, Flock status, tasks in progress.
+If quiet, just say 'All quiet 💤'."
+```
+
+### What the agent checks
+
+| Tool | What it shows |
+|------|---------------|
+| `sessions_list` | All active OpenClaw sessions with recent messages |
+| `flock_status` | Flock agent states (IDLE/ACTIVE/LEASED) |
+| `flock_tasks` | In-progress tasks |
+
+### Example output
+
+```
+📊 OpenClaw Briefing (15:30)
+
+Active Sessions: 3
+- main: discussing project architecture
+- dev-code: implementing auth module
+- cron:session-briefing: (this briefing)
+
+Flock Status:
+- Active: dev-code, pm
+- Idle: reviewer, qa, dev-prod
+- Tasks in progress: 2
+```
+
+---
+
 ## How it works
 
 ### Data model
