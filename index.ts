@@ -265,11 +265,25 @@ export default function register(api: any) {
   const activeTools = new Map<string, ActiveToolCall>(); // key = toolCallId (or generated)
   const recentTools: RecentToolCall[] = [];
 
+  type AgentActivity = {
+    lastToolAt: number;
+    lastToolName: string;
+    lastParamsSummary: string;
+    recentTools: Array<{name: string; paramsSummary: string; timestamp: number}>;
+  };
+  const agentActivity = new Map<string, AgentActivity>();
+
   const formatParamsSummary = (params: Record<string, unknown>, maxLen = 60): string => {
     // Extract the most useful param for common tools
+    if (params.reason && typeof params.reason === "string") {
+      const reason = params.reason.length > maxLen
+        ? params.reason.slice(0, maxLen) + "…"
+        : params.reason;
+      return `reason: ${reason}`;
+    }
     if (params.command && typeof params.command === "string") {
-      const cmd = params.command.length > maxLen 
-        ? params.command.slice(0, maxLen) + "…" 
+      const cmd = params.command.length > maxLen
+        ? params.command.slice(0, maxLen) + "…"
         : params.command;
       return `\`${cmd}\``;
     }
@@ -841,7 +855,7 @@ export default function register(api: any) {
   api.registerTool({
     name: "progress_briefing_agents",
     description:
-      "Show what each agent is currently doing (manual agent-reported status).",
+      "Show what each agent is currently doing (manual + auto-tracked).",
     parameters: Type.Object({}),
     async execute(_id: string, _params: any) {
       if (!enabled) {
@@ -868,33 +882,50 @@ export default function register(api: any) {
       };
 
       const extractAgentId = (jobId: string) => {
-        // agent:<agentId>:current
         const parts = jobId.split(":");
         return parts.length >= 3 ? parts[1] : "";
       };
 
-      // Deduplicate by agentId (keep most recently updated)
       const byAgent = new Map<string, JobRecord>();
       for (const j of agentJobs) {
         const agentId = extractAgentId(j.jobId);
         if (!agentId) continue;
-        if (!byAgent.has(agentId)) byAgent.set(agentId, j);
+        byAgent.set(agentId, j);
       }
-
-      const rows = [...byAgent.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 
       const lines: string[] = [];
       lines.push(`[progress-briefing] agent status — ${new Date().toLocaleString()}`);
-      if (!rows.length) {
-        lines.push("(no agent status yet — agents should report to jobId=agent:<id>:current)");
+
+      const allAgentIds = new Set([...byAgent.keys(), ...agentActivity.keys()]);
+      const sortedAgentIds = [...allAgentIds].sort((a, b) => a.localeCompare(b));
+
+      if (!sortedAgentIds.length) {
+        lines.push("(no agent activity yet — waiting for tool calls)");
         return { content: [{ type: "text", text: lines.join("\n") }] };
       }
 
-      for (const [agentId, j] of rows) {
-        const pct = typeof j.progress === "number" ? ` (${j.progress}%)` : "";
-        const detail = j.detail ? ` — ${j.detail}` : "";
-        const age = j.updatedAt ? ` · updated ${fmtAge(now() - j.updatedAt)} ago` : "";
-        lines.push(`- ${agentId}: [${j.state}]${pct}${detail}${age}`);
+      for (const agentId of sortedAgentIds) {
+        const manualJob = byAgent.get(agentId);
+        const autoTrack = agentActivity.get(agentId);
+
+        if (manualJob) {
+          const pct = typeof manualJob.progress === "number" ? ` (${manualJob.progress}%)` : "";
+          const detail = manualJob.detail ? ` — ${manualJob.detail}` : "";
+          const age = manualJob.updatedAt ? ` · updated ${fmtAge(now() - manualJob.updatedAt)} ago` : "";
+          lines.push(`- ${agentId}: [${manualJob.state}]${pct}${detail}${age}`);
+        } else if (autoTrack) {
+          const age = autoTrack.lastToolAt ? ` · ${fmtAge(now() - autoTrack.lastToolAt)} ago` : "";
+          const recentCount = autoTrack.recentTools.length;
+          const recentInfo = recentCount > 0 ? ` (${recentCount} recent)` : "";
+
+          const isIdle = autoTrack.lastToolName === "flock_sleep";
+          const statusIcon = isIdle ? "💤" : "🔄";
+          const statusLabel = isIdle ? "Idle" : "Working";
+
+          lines.push(`${statusIcon} ${agentId}: [${statusLabel}] — ${autoTrack.lastToolName} ${autoTrack.lastParamsSummary}${recentInfo}${age}`);
+        } else {
+          lines.push(`💤 ${agentId}: [idle] — No recent tool calls`);
+        }
       }
 
       return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -1108,7 +1139,28 @@ export default function register(api: any) {
       if (!toolName || excludeTools.has(toolName)) return;
 
       const callId = `${++callSeq}`;
-      
+
+      const agentId = ctx?.agentId || ctx?.sessionKey || "unknown";
+      const paramsSummary = formatParamsSummary(event?.params ?? {});
+
+      const existing = agentActivity.get(agentId) || {
+        lastToolAt: 0,
+        lastToolName: "",
+        lastParamsSummary: "",
+        recentTools: []
+      };
+
+      agentActivity.set(agentId, {
+        lastToolAt: now(),
+        lastToolName: toolName,
+        lastParamsSummary: paramsSummary,
+        recentTools: [...existing.recentTools, {
+          name: toolName,
+          paramsSummary,
+          timestamp: now()
+        }].slice(-5)
+      });
+
       activeTools.set(callId, {
         toolName,
         params: event?.params ?? {},
@@ -1116,8 +1168,17 @@ export default function register(api: any) {
         agentId: ctx?.agentId,
         startedAt: now(),
       });
-      
+
       api.logger.debug(`[progress-briefing] before_tool_call: ${toolName} (id=${callId})`);
+
+      upsertJob({
+        jobId: `agent:${agentId}:current`,
+        title: `${agentId} (auto)`,
+        owner: agentId,
+        state: "running",
+        detail: `Last tool: ${toolName} ${paramsSummary}`,
+        updatedAt: now()
+      });
     });
 
     // Use tool_result_persist instead of after_tool_call (more reliable)
